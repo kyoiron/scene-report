@@ -67,12 +67,44 @@ with st.sidebar:
     st.markdown("---")
     st.caption("臺灣高雄地方檢察署\n資訊室 Demo 系統")
 
-# ── Gemini 呼叫 ───────────────────────────────────────────
-def call_gemini(api_key, image_bytes, mime_type, extra=""):
+# ── Gemini 單張分析（含全案脈絡）────────────────────────
+def call_gemini(api_key, image_bytes, mime_type, extra="",
+                all_photos=None, target_index=0, case_num=""):
+    """
+    分析單張照片，但同時傳入所有照片供 AI 理解全案脈絡。
+    all_photos: list of {bytes, mime, name}，為所有照片
+    target_index: 本次要產生勘驗文字的照片編號（0-based）
+    """
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.5-flash-lite")
     extra_text = f"\n\n補充指示：{extra}" if extra.strip() else ""
-    prompt = f"""你是一位資深司法現場勘驗人員，請根據此照片，以繁體中文撰寫正式勘驗描述。
+    case_hint = f"案號：{case_num}。" if case_num and case_num.strip() else ""
+
+    # 有多張照片時，加入全案脈絡說明
+    if all_photos and len(all_photos) > 1:
+        total = len(all_photos)
+        context_prompt = f"""你是一位資深司法現場勘驗人員。
+{case_hint}本案共有 {total} 張現場照片，均為同一車禍事故現場。
+以下會先提供所有照片供你理解整體事故全貌，
+請針對【第 {target_index + 1} 張照片（{all_photos[target_index]['name']}）】撰寫勘驗描述。
+
+要求：
+1. 詳細描述該張照片的現場狀況、受損部位、損壞程度
+2. 如有車輛，描述各部位受損情形及估計修復費用範圍
+3. 如有跡證（血跡、碎片、標記物），詳細描述位置
+4. 語氣符合司法文書規範，使用被動語態，語句簡潔精準
+5. 分段描述，每段聚焦一個重點，不使用條列符號
+6. 適當處可與其他角度照片相互呼應（如：「與編號X照片所示相符」）
+7. 僅輸出該張照片的勘驗文字，不需標題或編號{extra_text}"""
+
+        content = [context_prompt]
+        for i, p in enumerate(all_photos):
+            marker = f"【{'→ 本張目標' if i == target_index else f'參考照片 {i+1}'}：{p['name']}】"
+            content.append(marker)
+            content.append({"mime_type": p["mime"], "data": p["bytes"]})
+    else:
+        # 單張模式（向下相容）
+        context_prompt = f"""你是一位資深司法現場勘驗人員，請根據此照片，以繁體中文撰寫正式勘驗描述。
 
 要求：
 1. 客觀描述現場狀況、受損部位、損壞程度
@@ -80,9 +112,9 @@ def call_gemini(api_key, image_bytes, mime_type, extra=""):
 3. 如有跡證（血跡、碎片、標記物），詳細描述位置
 4. 語氣符合司法文書規範，使用被動語態，語句簡潔精準
 5. 分段描述，每段聚焦一個重點，不使用條列符號{extra_text}"""
-    response = model.generate_content(
-        [prompt, {"mime_type": mime_type, "data": image_bytes}]
-    )
+        content = [context_prompt, {"mime_type": mime_type, "data": image_bytes}]
+
+    response = model.generate_content(content)
     return response.text
 
 # ── Gemini 全案關聯分析：所有照片一次送入 ─────────────────
@@ -242,12 +274,15 @@ else:
                 if not st.session_state.api_key:
                     st.error("請先在左側輸入 Gemini API Key")
                 else:
-                    with st.spinner(f"Gemini AI 分析第 {i+1} 張照片中..."):
+                    with st.spinner(f"Gemini AI 分析第 {i+1} 張照片中（含全案脈絡）..."):
                         try:
                             result = call_gemini(
                                 st.session_state.api_key,
                                 p["bytes"], p["mime"],
-                                st.session_state[prompt_key]
+                                st.session_state[prompt_key],
+                                all_photos=st.session_state.photos,
+                                target_index=i,
+                                case_num=st.session_state.get("case_num", "")
                             )
                             # 關鍵：先刪 widget key，rerun 後重新初始化才能顯示新值
                             st.session_state.photos[i]["text"] = result
@@ -259,52 +294,25 @@ else:
         st.markdown("---")
 
     # ── 批次生成 + 匯出 ───────────────────────────────────
-    st.markdown("---")
-    st.markdown('<div class="field-label">⚡ 批次 AI 生成</div>', unsafe_allow_html=True)
-
-    # 模式選擇
-    mode = st.radio(
-        "生成模式",
-        options=["🔗 全案關聯分析（推薦）", "📷 逐張獨立分析"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="gen_mode"
-    )
-    st.caption("🔗 全案關聯分析：所有照片一次送入 AI，理解整體案件後產生具關聯性的勘驗文字（推薦）　|　📷 逐張獨立分析：每張照片單獨分析，適合照片主題差異較大時")
-
     b1, b2 = st.columns(2)
 
     with b1:
-        btn_label = "🔗 全案關聯分析生成" if "關聯" in mode else "⚡ 逐張獨立生成"
-        if st.button(btn_label, use_container_width=True):
+        if st.button("⚡ 全部照片 AI 生成（含全案脈絡）", use_container_width=True):
             if not st.session_state.api_key:
                 st.error("請先輸入 API Key")
-            elif "關聯" in mode:
-                # ── 全案關聯模式：所有照片一次送入 ──
-                with st.spinner(f"AI 正在分析全部 {len(st.session_state.photos)} 張照片，理解整體案件中..."):
-                    try:
-                        case_num = st.session_state.get("case_num", "")
-                        results = call_gemini_all(
-                            st.session_state.api_key,
-                            st.session_state.photos,
-                            case_num
-                        )
-                        for i, result in enumerate(results):
-                            st.session_state.photos[i]["text"] = result
-                        clear_widget_states()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"全案分析失敗：{e}")
             else:
-                # ── 逐張獨立模式 ──
                 prog = st.progress(0, text="批次分析中...")
+                case_num = st.session_state.get("case_num", "")
                 for i in range(len(st.session_state.photos)):
                     p = st.session_state.photos[i]
                     try:
                         result = call_gemini(
                             st.session_state.api_key,
                             p["bytes"], p["mime"],
-                            p["prompt"]
+                            p["prompt"],
+                            all_photos=st.session_state.photos,
+                            target_index=i,
+                            case_num=case_num
                         )
                         st.session_state.photos[i]["text"] = result
                     except Exception as e:
