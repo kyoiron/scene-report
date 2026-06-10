@@ -85,6 +85,57 @@ def call_gemini(api_key, image_bytes, mime_type, extra=""):
     )
     return response.text
 
+# ── Gemini 全案關聯分析：所有照片一次送入 ─────────────────
+def call_gemini_all(api_key, photos, case_num=""):
+    import json
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    total = len(photos)
+    case_hint = f"案號：{case_num}。" if case_num.strip() else ""
+    system_prompt = f"""你是一位資深司法現場勘驗人員。
+{case_hint}以下共 {total} 張照片，均為同一車禍事故現場的不同角度或部位。
+
+請先綜合理解整個事故現場全貌，再針對每張照片分別撰寫勘驗描述。
+各照片之勘驗文字應具有關聯性，避免重複描述，並在適當處相互呼應。
+
+輸出格式（必須嚴格遵守，僅輸出 JSON 不要有其他文字）：
+{{
+  "overview": "整體事故現場概述（2-3句）",
+  "photos": [
+    {{"index": 1, "text": "第1張照片勘驗文字"}},
+    {{"index": 2, "text": "第2張照片勘驗文字"}}
+  ]
+}}
+
+每張照片勘驗文字需符合司法文書規範，使用被動語態，分段描述，不使用條列符號。"""
+
+    content_list = [system_prompt]
+    for i, p in enumerate(photos):
+        content_list.append(f"\n【照片編號 {i+1}：{p['name']}】")
+        content_list.append({"mime_type": p["mime"], "data": p["bytes"]})
+
+    response = model.generate_content(content_list)
+    raw = response.text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+
+    data = json.loads(raw)
+    results = [""] * total
+    overview = data.get("overview", "")
+    for item in data.get("photos", []):
+        idx = item.get("index", 0) - 1
+        if 0 <= idx < total:
+            text = item.get("text", "")
+            if idx == 0 and overview:
+                results[idx] = f"【現場概述】{overview}\n\n{text}"
+            else:
+                results[idx] = text
+    return results
+
+
 # ── 工具函式：清除所有 widget state ──────────────────────
 def clear_widget_states():
     for k in list(st.session_state.keys()):
@@ -208,13 +259,44 @@ else:
         st.markdown("---")
 
     # ── 批次生成 + 匯出 ───────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="field-label">⚡ 批次 AI 生成</div>', unsafe_allow_html=True)
+
+    # 模式選擇
+    mode = st.radio(
+        "生成模式",
+        options=["🔗 全案關聯分析（推薦）", "📷 逐張獨立分析"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="gen_mode"
+    )
+    st.caption("🔗 全案關聯分析：所有照片一次送入 AI，理解整體案件後產生具關聯性的勘驗文字（推薦）　|　📷 逐張獨立分析：每張照片單獨分析，適合照片主題差異較大時")
+
     b1, b2 = st.columns(2)
 
     with b1:
-        if st.button("⚡ 全部照片 AI 生成", use_container_width=True):
+        btn_label = "🔗 全案關聯分析生成" if "關聯" in mode else "⚡ 逐張獨立生成"
+        if st.button(btn_label, use_container_width=True):
             if not st.session_state.api_key:
                 st.error("請先輸入 API Key")
+            elif "關聯" in mode:
+                # ── 全案關聯模式：所有照片一次送入 ──
+                with st.spinner(f"AI 正在分析全部 {len(st.session_state.photos)} 張照片，理解整體案件中..."):
+                    try:
+                        case_num = st.session_state.get("case_num", "")
+                        results = call_gemini_all(
+                            st.session_state.api_key,
+                            st.session_state.photos,
+                            case_num
+                        )
+                        for i, result in enumerate(results):
+                            st.session_state.photos[i]["text"] = result
+                        clear_widget_states()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"全案分析失敗：{e}")
             else:
+                # ── 逐張獨立模式 ──
                 prog = st.progress(0, text="批次分析中...")
                 for i in range(len(st.session_state.photos)):
                     p = st.session_state.photos[i]
@@ -231,7 +313,6 @@ else:
                         (i+1) / len(st.session_state.photos),
                         text=f"處理中 {i+1}/{len(st.session_state.photos)}..."
                     )
-                # 批次完成後清除所有 txt_ widget key，讓 rerun 重新初始化
                 clear_widget_states()
                 st.rerun()
 
